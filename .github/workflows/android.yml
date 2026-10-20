@@ -1,0 +1,28 @@
+
+name: Build Android Mod
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Android64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Geode mod
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          target: Android64
+
+      - name: Upload mod artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FrameCorrection-Android64
+          path: "**/*.geode"
