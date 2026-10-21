@@ -5,23 +5,38 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <mutex>
 
 using namespace geode::prelude;
-using Clock = std::chrono::steady_clock;
+using FCClock = std::chrono::steady_clock;
 
-namespace FC {
+namespace FrameCorrection {
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
 constexpr double TARGET_TPS = 240.0;
 constexpr double TARGET_TICK_US = 1'000'000.0 / TARGET_TPS;
 
-constexpr size_t MAX_PENDING = 2048;
-constexpr size_t MAX_HISTORY = 512;
-constexpr double MIN_PERIOD_US = 1000.0;
-constexpr double MAX_PERIOD_US = 100000.0;
-constexpr double SMOOTHING = 0.15;
+constexpr size_t MAX_PENDING_EVENTS = 2048;
+constexpr size_t MAX_UPDATE_HISTORY = 512;
+
+constexpr double MIN_UPDATE_INTERVAL_US = 1000.0;
+constexpr double MAX_UPDATE_INTERVAL_US = 100000.0;
+constexpr double OUTLIER_FACTOR = 3.0;
+constexpr double EMA_ALPHA = 0.15;
+
+// Safe mode: original game input is never replayed.
+// This prototype estimates timing but does not modify physics.
+constexpr bool SAFE_INPUT_MODE = true;
+
+// ============================================================
+// DATA
+// ============================================================
 
 struct InputEvent {
     uint64_t sequence;
@@ -33,87 +48,167 @@ struct InputEvent {
 };
 
 struct UpdateSample {
-    uint64_t tick;
+    uint64_t updateNumber;
     int64_t timestampUs;
-    float dt;
+    double levelTime;
+    double dt;
 };
 
-struct Prediction {
+struct TimingStats {
+    uint64_t updateCount = 0;
+    uint64_t eventCount = 0;
+    uint64_t droppedEvents = 0;
+    uint64_t staleEvents = 0;
+    uint64_t outlierIntervals = 0;
+
+    int64_t lastUpdateUs = 0;
+    double estimatedUpdateUs = 0.0;
+    double lastDt = 0.0;
+};
+
+struct TimingPrediction {
     bool valid = false;
-    uint64_t estimatedTick = 0;
-    double periodUs = 0.0;
+    bool stale = false;
+
+    uint64_t estimatedUpdate = 0;
+
+    double estimatedPeriodUs = 0.0;
     double phaseErrorUs = 0.0;
-    double nearestBoundaryUs = 0.0;
+    double untilNextUpdateUs = 0.0;
+    double targetTickMs = TARGET_TICK_US / 1000.0;
 };
 
 static std::mutex g_mutex;
 static std::deque<InputEvent> g_pending;
 static std::deque<UpdateSample> g_history;
+static TimingStats g_stats;
 
-static uint64_t g_sequence = 0;
-static uint64_t g_updateCount = 0;
-static uint64_t g_dropped = 0;
-static double g_periodUs = 0.0;
+static uint64_t g_nextSequence = 0;
 
-int64_t nowUs() {
+// ============================================================
+// CLOCK
+// ============================================================
+
+static int64_t nowUs() {
     return std::chrono::duration_cast<
         std::chrono::microseconds
-    >(Clock::now().time_since_epoch()).count();
+    >(FCClock::now().time_since_epoch()).count();
 }
 
-void capture(InputEvent event) {
+// ============================================================
+// INPUT CAPTURE
+// ============================================================
+
+static void captureInput(
+    bool down,
+    int button,
+    bool player1,
+    double levelTime
+) {
+    const int64_t timestamp = nowUs();
+
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    event.sequence = ++g_sequence;
+    ++g_stats.eventCount;
 
-    if (g_pending.size() >= MAX_PENDING) {
-        ++g_dropped;
+    if (g_pending.size() >= MAX_PENDING_EVENTS) {
+        ++g_stats.droppedEvents;
         return;
     }
 
-    g_pending.push_back(event);
+    g_pending.push_back({
+        ++g_nextSequence,
+        timestamp,
+        levelTime,
+        down,
+        button,
+        player1
+    });
 }
 
-void observeUpdate(float dt, int64_t timestampUs) {
+// ============================================================
+// UPDATE OBSERVATION
+// ============================================================
+
+static void observeUpdate(
+    double dt,
+    double levelTime,
+    int64_t timestamp
+) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    const uint64_t tick = ++g_updateCount;
+    ++g_stats.updateCount;
 
-    if (!g_history.empty()) {
+    if (g_stats.lastUpdateUs != 0) {
         const double interval =
             static_cast<double>(
-                timestampUs - g_history.back().timestampUs
+                timestamp - g_stats.lastUpdateUs
             );
 
-        if (interval >= MIN_PERIOD_US &&
-            interval <= MAX_PERIOD_US) {
-            if (g_periodUs == 0.0) {
-                g_periodUs = interval;
-            } else {
-                g_periodUs =
-                    (1.0 - SMOOTHING) * g_periodUs +
-                    SMOOTHING * interval;
+        if (interval >= MIN_UPDATE_INTERVAL_US &&
+            interval <= MAX_UPDATE_INTERVAL_US) {
+
+            const bool isOutlier =
+                g_stats.estimatedUpdateUs > 0.0 &&
+                (interval >
+                    g_stats.estimatedUpdateUs * OUTLIER_FACTOR ||
+                 interval <
+                    g_stats.estimatedUpdateUs / OUTLIER_FACTOR);
+
+            if (isOutlier) {
+                ++g_stats.outlierIntervals;
             }
+
+            // Do not let large pauses distort the estimator.
+            if (!isOutlier) {
+                if (g_stats.estimatedUpdateUs <= 0.0) {
+                    g_stats.estimatedUpdateUs = interval;
+                } else {
+                    g_stats.estimatedUpdateUs =
+                        (1.0 - EMA_ALPHA) *
+                            g_stats.estimatedUpdateUs +
+                        EMA_ALPHA * interval;
+                }
+            }
+        } else {
+            ++g_stats.outlierIntervals;
         }
     }
 
-    g_history.push_back({tick, timestampUs, dt});
+    g_stats.lastUpdateUs = timestamp;
+    g_stats.lastDt = dt;
 
-    while (g_history.size() > MAX_HISTORY) {
+    g_history.push_back({
+        g_stats.updateCount,
+        timestamp,
+        levelTime,
+        dt
+    });
+
+    while (g_history.size() > MAX_UPDATE_HISTORY) {
         g_history.pop_front();
     }
 }
 
-Prediction predict(int64_t inputTimestampUs) {
+// ============================================================
+// PREDICTIVE TIMING ESTIMATOR
+// ============================================================
+
+static TimingPrediction predictInput(
+    int64_t inputTimestampUs
+) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    Prediction result;
+    TimingPrediction result;
 
-    if (g_history.size() < 2 || g_periodUs <= 0.0) {
+    result.estimatedPeriodUs =
+        g_stats.estimatedUpdateUs;
+
+    if (g_history.size() < 2 ||
+        g_stats.estimatedUpdateUs <= 0.0) {
         return result;
     }
 
-    // Find the latest observed update at or before input time.
     const UpdateSample* previous = nullptr;
     const UpdateSample* next = nullptr;
 
@@ -126,16 +221,16 @@ Prediction predict(int64_t inputTimestampUs) {
         }
     }
 
+    // Input older than retained history: prediction is unreliable.
     if (!previous) {
-        // The input predates our retained history.
+        result.stale = true;
         return result;
     }
 
     result.valid = true;
-    result.periodUs = g_periodUs;
 
     if (next) {
-        // The input is bracketed by two observed update boundaries.
+        // Input is between two observed update boundaries.
         const double span = static_cast<double>(
             next->timestampUs - previous->timestampUs
         );
@@ -144,139 +239,195 @@ Prediction predict(int64_t inputTimestampUs) {
             inputTimestampUs - previous->timestampUs
         );
 
+        if (span <= 0.0) {
+            result.valid = false;
+            return result;
+        }
+
         const double fraction =
-            span > 0.0 ? std::clamp(offset / span, 0.0, 1.0) : 0.0;
+            std::clamp(offset / span, 0.0, 1.0);
 
-        result.estimatedTick =
-            fraction < 0.5 ? previous->tick : next->tick;
-
-        const double toPrevious = offset;
-        const double toNext = span - offset;
-
-        result.phaseErrorUs =
-            std::min(toPrevious, toNext);
-
-        result.nearestBoundaryUs =
-            toPrevious <= toNext
-                ? previous->timestampUs
-                : next->timestampUs;
-    } else {
-        // Input is newer than the latest update.
-        const double elapsed = static_cast<double>(
-            inputTimestampUs - previous->timestampUs
-        );
-
-        const uint64_t periodsAhead =
-            static_cast<uint64_t>(elapsed / g_periodUs);
-
-        result.estimatedTick =
-            previous->tick + periodsAhead;
-
-        const double phase =
-            elapsed - periodsAhead * g_periodUs;
+        result.estimatedUpdate =
+            fraction < 0.5
+                ? previous->updateNumber
+                : next->updateNumber;
 
         result.phaseErrorUs =
-            std::min(phase, g_periodUs - phase);
+            std::min(offset, span - offset);
 
-        result.nearestBoundaryUs =
-            previous->timestampUs +
-            static_cast<int64_t>(
-                (phase < g_periodUs / 2.0
-                    ? periodsAhead
-                    : periodsAhead + 1) * g_periodUs
-            );
+        result.untilNextUpdateUs =
+            span - offset;
+
+        return result;
     }
+
+    // Input is newer than the latest observed update.
+    const double elapsed = static_cast<double>(
+        inputTimestampUs - previous->timestampUs
+    );
+
+    const double period = g_stats.estimatedUpdateUs;
+
+    if (elapsed > period * OUTLIER_FACTOR) {
+        result.stale = true;
+        result.valid = false;
+        return result;
+    }
+
+    const auto periodsAhead =
+        static_cast<uint64_t>(elapsed / period);
+
+    const double phase =
+        elapsed - periodsAhead * period;
+
+    result.estimatedUpdate =
+        previous->updateNumber + periodsAhead;
+
+    result.phaseErrorUs =
+        std::min(phase, period - phase);
+
+    result.untilNextUpdateUs =
+        period - phase;
 
     return result;
 }
 
-std::deque<InputEvent> drain() {
+// ============================================================
+// EVENT QUEUE
+// ============================================================
+
+static std::deque<InputEvent> drainEvents() {
     std::lock_guard<std::mutex> lock(g_mutex);
 
     std::deque<InputEvent> events;
     events.swap(g_pending);
+
     return events;
 }
 
-uint64_t takeDropped() {
+static TimingStats getStats() {
     std::lock_guard<std::mutex> lock(g_mutex);
-
-    const uint64_t result = g_dropped;
-    g_dropped = 0;
-    return result;
+    return g_stats;
 }
 
-} // namespace FC
+static void markStale() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_stats.staleEvents;
+}
 
+// ============================================================
+// DIAGNOSTICS
+// ============================================================
+
+static void logEvent(const InputEvent& event) {
+    const auto prediction =
+        predictInput(event.timestampUs);
+
+    const double ageMs =
+        static_cast<double>(
+            nowUs() - event.timestampUs
+        ) / 1000.0;
+
+    if (!prediction.valid) {
+        log::info(
+            "[FC ALL] seq={} {} button={} "
+            "prediction={} age={:.3f}ms",
+            event.sequence,
+            event.down ? "PRESS" : "RELEASE",
+            event.button,
+            prediction.stale ? "STALE" : "WARMING_UP",
+            ageMs
+        );
+
+        if (prediction.stale) {
+            markStale();
+        }
+
+        return;
+    }
+
+    log::info(
+        "[FC ALL] seq={} {} button={} "
+        "update={} period={:.3f}ms "
+        "phaseError={:.3f}ms "
+        "untilNext={:.3f}ms "
+        "target240TPS={:.3f}ms age={:.3f}ms",
+        event.sequence,
+        event.down ? "PRESS" : "RELEASE",
+        event.button,
+        prediction.estimatedUpdate,
+        prediction.estimatedPeriodUs / 1000.0,
+        prediction.phaseErrorUs / 1000.0,
+        prediction.untilNextUpdateUs / 1000.0,
+        prediction.targetTickMs,
+        ageMs
+    );
+}
+
+} // namespace FrameCorrection
+
+// ============================================================
+// ORIGINAL INPUT HOOK
+// ============================================================
 
 class $modify(FCInputLayer, GJBaseGameLayer) {
-    void handleButton(bool down, int button, bool isPlayer1) {
-        FC::capture({
-            0,
-            FC::nowUs(),
-            m_gameState.m_levelTime,
+    void handleButton(
+        bool down,
+        int button,
+        bool isPlayer1
+    ) {
+        FrameCorrection::captureInput(
+            down,
+            button,
+            isPlayer1,
+            m_gameState.m_levelTime
+        );
+
+        // Original game input is preserved exactly once.
+        GJBaseGameLayer::handleButton(
             down,
             button,
             isPlayer1
-        });
-
-        // Do not replay or delay the original input.
-        GJBaseGameLayer::handleButton(
-            down, button, isPlayer1
         );
     }
 };
 
+// ============================================================
+// UPDATE HOOK
+// ============================================================
 
 class $modify(FCPlayLayer, PlayLayer) {
     void postUpdate(float dt) {
-        FC::observeUpdate(dt, FC::nowUs());
+        FrameCorrection::observeUpdate(
+            dt,
+            m_gameState.m_levelTime,
+            FrameCorrection::nowUs()
+        );
 
-        const auto events = FC::drain();
+        const auto events =
+            FrameCorrection::drainEvents();
 
         for (const auto& event : events) {
-            const auto prediction =
-                FC::predict(event.timestampUs);
-
-            const double observedMs =
-                static_cast<double>(
-                    FC::nowUs() - event.timestampUs
-                ) / 1000.0;
-
-            if (prediction.valid) {
-                log::info(
-                    "[FC FIX EXP] seq={} {} button={} "
-                    "estimatedTick={} phaseError={:.3f}ms "
-                    "period={:.3f}ms observed={:.3f}ms",
-                    event.sequence,
-                    event.down ? "PRESS" : "RELEASE",
-                    event.button,
-                    prediction.estimatedTick,
-                    prediction.phaseErrorUs / 1000.0,
-                    prediction.periodUs / 1000.0,
-                    observedMs
-                );
-            } else {
-                log::info(
-                    "[FC FIX EXP] seq={} {} "
-                    "estimator=insufficient-history "
-                    "observed={:.3f}ms",
-                    event.sequence,
-                    event.down ? "PRESS" : "RELEASE",
-                    observedMs
-                );
-            }
+            FrameCorrection::logEvent(event);
         }
 
-        const uint64_t dropped = FC::takeDropped();
+        const auto stats =
+            FrameCorrection::getStats();
 
-        if (dropped > 0) {
+        if (stats.droppedEvents > 0) {
             log::warn(
-                "[FC FIX EXP] {} audit events dropped",
-                dropped
+                "[FC ALL] droppedEvents={} staleEvents={} "
+                "outlierIntervals={} updates={} "
+                "estimatedPeriod={:.3f}ms",
+                stats.droppedEvents,
+                stats.staleEvents,
+                stats.outlierIntervals,
+                stats.updateCount,
+                stats.estimatedUpdateUs / 1000.0
             );
         }
 
+        // Preserve normal game update behavior.
         PlayLayer::postUpdate(dt);
     }
 };
