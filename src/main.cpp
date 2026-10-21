@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -19,6 +18,7 @@ constexpr double TARGET_TPS = 240.0;
 constexpr double TARGET_TICK_US = 1'000'000.0 / TARGET_TPS;
 
 constexpr size_t MAX_PENDING = 2048;
+constexpr size_t MAX_HISTORY = 512;
 constexpr double MIN_PERIOD_US = 1000.0;
 constexpr double MAX_PERIOD_US = 100000.0;
 constexpr double SMOOTHING = 0.15;
@@ -32,118 +32,178 @@ struct InputEvent {
     bool player1;
 };
 
-struct TimingState {
-    uint64_t updates = 0;
-    int64_t lastUpdateUs = 0;
-    double estimatedPeriodUs = 0.0;
-    double lastDt = 0.0;
-    uint64_t dropped = 0;
+struct UpdateSample {
+    uint64_t tick;
+    int64_t timestampUs;
+    float dt;
 };
 
 struct Prediction {
     bool valid = false;
+    uint64_t estimatedTick = 0;
     double periodUs = 0.0;
-    double untilUpdateUs = 0.0;
     double phaseErrorUs = 0.0;
-    int64_t estimatedTick = -1;
+    double nearestBoundaryUs = 0.0;
 };
 
 static std::mutex g_mutex;
 static std::deque<InputEvent> g_pending;
-static TimingState g_timing;
-static uint64_t g_nextSequence = 1;
+static std::deque<UpdateSample> g_history;
 
-static int64_t nowUs() {
+static uint64_t g_sequence = 0;
+static uint64_t g_updateCount = 0;
+static uint64_t g_dropped = 0;
+static double g_periodUs = 0.0;
+
+int64_t nowUs() {
     return std::chrono::duration_cast<
         std::chrono::microseconds
     >(Clock::now().time_since_epoch()).count();
 }
 
-// Capture is diagnostic only. It does not delay gameplay input.
-static void capture(InputEvent event) {
+void capture(InputEvent event) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    event.sequence = g_nextSequence++;
+    event.sequence = ++g_sequence;
 
     if (g_pending.size() >= MAX_PENDING) {
-        ++g_timing.dropped;
+        ++g_dropped;
         return;
     }
 
     g_pending.push_back(event);
 }
 
-static void observeUpdate(float dt, int64_t now) {
+void observeUpdate(float dt, int64_t timestampUs) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    if (g_timing.lastUpdateUs != 0) {
+    const uint64_t tick = ++g_updateCount;
+
+    if (!g_history.empty()) {
         const double interval =
-            static_cast<double>(now - g_timing.lastUpdateUs);
+            static_cast<double>(
+                timestampUs - g_history.back().timestampUs
+            );
 
         if (interval >= MIN_PERIOD_US &&
             interval <= MAX_PERIOD_US) {
-            if (g_timing.estimatedPeriodUs <= 0.0) {
-                g_timing.estimatedPeriodUs = interval;
+            if (g_periodUs == 0.0) {
+                g_periodUs = interval;
             } else {
-                g_timing.estimatedPeriodUs =
-                    (1.0 - SMOOTHING) *
-                        g_timing.estimatedPeriodUs +
+                g_periodUs =
+                    (1.0 - SMOOTHING) * g_periodUs +
                     SMOOTHING * interval;
             }
         }
     }
 
-    g_timing.lastUpdateUs = now;
-    g_timing.lastDt = dt;
-    ++g_timing.updates;
+    g_history.push_back({tick, timestampUs, dt});
+
+    while (g_history.size() > MAX_HISTORY) {
+        g_history.pop_front();
+    }
 }
 
-static Prediction predict(int64_t timestampUs) {
+Prediction predict(int64_t inputTimestampUs) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    Prediction p;
+    Prediction result;
 
-    if (g_timing.lastUpdateUs == 0 ||
-        g_timing.estimatedPeriodUs <= 0.0) {
-        return p;
+    if (g_history.size() < 2 || g_periodUs <= 0.0) {
+        return result;
     }
 
-    const double period = g_timing.estimatedPeriodUs;
-    const double elapsed =
-        static_cast<double>(timestampUs - g_timing.lastUpdateUs);
+    // Find the latest observed update at or before input time.
+    const UpdateSample* previous = nullptr;
+    const UpdateSample* next = nullptr;
 
-    if (elapsed < 0.0) {
-        return p;
+    for (const auto& sample : g_history) {
+        if (sample.timestampUs <= inputTimestampUs) {
+            previous = &sample;
+        } else {
+            next = &sample;
+            break;
+        }
     }
 
-    const auto completedPeriods =
-        static_cast<int64_t>(std::floor(elapsed / period));
+    if (!previous) {
+        // The input predates our retained history.
+        return result;
+    }
 
-    const double phase =
-        elapsed - completedPeriods * period;
+    result.valid = true;
+    result.periodUs = g_periodUs;
 
-    p.valid = true;
-    p.periodUs = period;
-    p.untilUpdateUs = period - phase;
-    p.phaseErrorUs = std::min(phase, period - phase);
-    p.estimatedTick =
-        static_cast<int64_t>(g_timing.updates) +
-        completedPeriods + 1;
+    if (next) {
+        // The input is bracketed by two observed update boundaries.
+        const double span = static_cast<double>(
+            next->timestampUs - previous->timestampUs
+        );
 
-    return p;
-}
+        const double offset = static_cast<double>(
+            inputTimestampUs - previous->timestampUs
+        );
 
-static std::deque<InputEvent> drain() {
-    std::lock_guard<std::mutex> lock(g_mutex);
+        const double fraction =
+            span > 0.0 ? std::clamp(offset / span, 0.0, 1.0) : 0.0;
 
-    std::deque<InputEvent> result;
-    result.swap(g_pending);
+        result.estimatedTick =
+            fraction < 0.5 ? previous->tick : next->tick;
+
+        const double toPrevious = offset;
+        const double toNext = span - offset;
+
+        result.phaseErrorUs =
+            std::min(toPrevious, toNext);
+
+        result.nearestBoundaryUs =
+            toPrevious <= toNext
+                ? previous->timestampUs
+                : next->timestampUs;
+    } else {
+        // Input is newer than the latest update.
+        const double elapsed = static_cast<double>(
+            inputTimestampUs - previous->timestampUs
+        );
+
+        const uint64_t periodsAhead =
+            static_cast<uint64_t>(elapsed / g_periodUs);
+
+        result.estimatedTick =
+            previous->tick + periodsAhead;
+
+        const double phase =
+            elapsed - periodsAhead * g_periodUs;
+
+        result.phaseErrorUs =
+            std::min(phase, g_periodUs - phase);
+
+        result.nearestBoundaryUs =
+            previous->timestampUs +
+            static_cast<int64_t>(
+                (phase < g_periodUs / 2.0
+                    ? periodsAhead
+                    : periodsAhead + 1) * g_periodUs
+            );
+    }
+
     return result;
 }
 
-static TimingState snapshot() {
+std::deque<InputEvent> drain() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_timing;
+
+    std::deque<InputEvent> events;
+    events.swap(g_pending);
+    return events;
+}
+
+uint64_t takeDropped() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    const uint64_t result = g_dropped;
+    g_dropped = 0;
+    return result;
 }
 
 } // namespace FC
@@ -160,7 +220,7 @@ class $modify(FCInputLayer, GJBaseGameLayer) {
             isPlayer1
         });
 
-        // Original input executes exactly once.
+        // Do not replay or delay the original input.
         GJBaseGameLayer::handleButton(
             down, button, isPlayer1
         );
@@ -170,58 +230,50 @@ class $modify(FCInputLayer, GJBaseGameLayer) {
 
 class $modify(FCPlayLayer, PlayLayer) {
     void postUpdate(float dt) {
-        const int64_t now = FC::nowUs();
+        FC::observeUpdate(dt, FC::nowUs());
 
-        FC::observeUpdate(dt, now);
-
-        auto events = FC::drain();
-        const auto state = FC::snapshot();
+        const auto events = FC::drain();
 
         for (const auto& event : events) {
-            const double observedMs =
-                static_cast<double>(
-                    now - event.timestampUs
-                ) / 1000.0;
-
             const auto prediction =
                 FC::predict(event.timestampUs);
 
+            const double observedMs =
+                static_cast<double>(
+                    FC::nowUs() - event.timestampUs
+                ) / 1000.0;
+
             if (prediction.valid) {
                 log::info(
-                    "[FC v0.2] seq={} action={} button={} "
-                    "observed={:.3f}ms "
-                    "updatePeriod={:.3f}ms "
-                    "untilPredictedUpdate={:.3f}ms "
-                    "phaseError={:.3f}ms "
-                    "estimatedTick={} "
-                    "dt={:.6f} targetTick={:.3f}ms",
+                    "[FC FIX EXP] seq={} {} button={} "
+                    "estimatedTick={} phaseError={:.3f}ms "
+                    "period={:.3f}ms observed={:.3f}ms",
                     event.sequence,
                     event.down ? "PRESS" : "RELEASE",
                     event.button,
-                    observedMs,
-                    prediction.periodUs / 1000.0,
-                    prediction.untilUpdateUs / 1000.0,
-                    prediction.phaseErrorUs / 1000.0,
                     prediction.estimatedTick,
-                    dt,
-                    FC::TARGET_TICK_US / 1000.0
+                    prediction.phaseErrorUs / 1000.0,
+                    prediction.periodUs / 1000.0,
+                    observedMs
                 );
             } else {
                 log::info(
-                    "[FC v0.2] seq={} action={} button={} "
-                    "observed={:.3f}ms estimator=warming-up",
+                    "[FC FIX EXP] seq={} {} "
+                    "estimator=insufficient-history "
+                    "observed={:.3f}ms",
                     event.sequence,
                     event.down ? "PRESS" : "RELEASE",
-                    event.button,
                     observedMs
                 );
             }
         }
 
-        if (state.dropped > 0) {
+        const uint64_t dropped = FC::takeDropped();
+
+        if (dropped > 0) {
             log::warn(
-                "[FC v0.2] {} audit events dropped",
-                state.dropped
+                "[FC FIX EXP] {} audit events dropped",
+                dropped
             );
         }
 
