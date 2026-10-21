@@ -2,50 +2,55 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <chrono>
+#include <atomic>
 
 using namespace geode::prelude;
 
-// Variabel global untuk tracking waktu nyata (Real Time)
+// Gunakan atomic agar aman dibaca/tulis antar-thread di ARM64 Android
 auto g_lastUpdateRealTime = std::chrono::steady_clock::now();
-bool g_inputJustHappened = false;
-int64_t g_realInputTimestamp = 0;
-int g_framesSinceInput = 0;
+std::atomic<bool> g_inputJustHappened(false);
+std::atomic<int64_t> g_realInputTimestamp(0);
+std::atomic<double> g_inputLevelTime(0.0);
 
 class $modify(AuditPlayLayer, PlayLayer) {
-    void update(float dt) {
-        // Hitung real-time ms sejak frame terakhir dirender
+    // Kita kembali gunakan postUpdate karena terbukti terpanggil di kode aslimu
+    void postUpdate(float dt) {
         auto now = std::chrono::steady_clock::now();
         double realDtMs = std::chrono::duration_cast<std::chrono::microseconds>(now - g_lastUpdateRealTime).count() / 1000.0;
         g_lastUpdateRealTime = now;
 
-        // Jika baru saja ada input masuk, kita log frame INI untuk melihat reaksinya
-        if (g_inputJustHappened) {
-            double latencyMs = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count() / 1000.0 - (g_realInputTimestamp / 1000.0);
+        // Cek apakah ada input dari thread sebelah
+        if (g_inputJustHappened.load()) {
+            double latencyMs = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count() / 1000.0 - (g_realInputTimestamp.load() / 1000.0);
             
             log::info(
-                "[AUDIT UPDATE] Frame merespons input! Latensi Sentuh -> Update: {:.2f}ms | Real dt: {:.2f}ms | Game dt: {:.5f} | LevelTime: {:.4f}", 
-                latencyMs, realDtMs, dt, m_gameState.m_levelTime
+                "[AUDIT UPDATE] Respon Input! Latensi: {:.2f}ms | Real dt: {:.2f}ms | Game dt: {:.5f} | InputTime: {:.4f} -> ExecTime: {:.4f}", 
+                latencyMs, realDtMs, dt, g_inputLevelTime.load(), m_gameState.m_levelTime
             );
             
-            g_inputJustHappened = false; // Reset setelah dicatat
+            // Reset state
+            g_inputJustHappened.store(false);
         }
 
-        PlayLayer::update(dt);
+        PlayLayer::postUpdate(dt);
     }
 };
 
 class $modify(AuditInputLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
-        // Ambil timestamp seakurat mungkin saat layar HP disentuh
         auto now = std::chrono::steady_clock::now();
-        g_realInputTimestamp = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+        
+        // Simpan waktu nyata dan waktu game ke variabel atomic
+        g_realInputTimestamp.store(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count());
+        g_inputLevelTime.store(m_gameState.m_levelTime);
         
         log::info(
             "[AUDIT INPUT] {} | Button: {} | LevelTime: {:.4f}", 
             down ? "PRESS" : "RELEASE", button, m_gameState.m_levelTime
         );
         
-        g_inputJustHappened = true; // Beri tahu fungsi update() bahwa ada input
+        // Beri sinyal ke postUpdate bahwa ada event baru
+        g_inputJustHappened.store(true);
         
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
